@@ -24,5 +24,21 @@ for tag in soup(["script", "style", "noscript", "iframe"]):
 
 text = soup.get_text("\n")
 
-print(text.strip())
+lines = [line.strip() for line in text.splitlines()]
+paragraphs = []
+current = []
 
+for line in lines:
+    if not line:
+        if current:
+            paragraphs.append(" ".join(current))
+            current = []
+        continue
+    current.append(line)
+
+if current:
+    paragraphs.append(" ".join(current))
+
+normalized = "\n\n".join(paragraphs)
+
+print(normalized.strip())
