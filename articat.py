@@ -7,7 +7,7 @@ from urllib.request import Request, urlopen
 from playwright.async_api import async_playwright
 from PIL import Image
 from readability import Document
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 
 UA = "Mozilla/5.0"
 HALF_BLOCK = "\u2580"
@@ -84,21 +84,29 @@ def count_headings(soup):
     return len(soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"]))
 
 
-def extract_fallback_text(full_soup):
+def extract_fallback_blocks(full_soup, base_url):
     container = full_soup.find("article") or full_soup
-    for tag in container(["script", "style", "noscript", "iframe"]):
+    for tag in container(
+        ["script", "style", "noscript", "iframe", "nav", "header", "footer", "aside"]
+    ):
+        tag.decompose()
+    for tag in container.find_all(attrs={"role": ["navigation", "banner", "contentinfo"]}):
         tag.decompose()
 
     has_testid = container.find(attrs={"data-testid": True}) is not None
 
     def classify_node(node):
-        if not getattr(node, "name", None):
+        if not isinstance(node, Tag):
             return None
         tag = node.name
         if tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
             return "heading"
         if tag == "p":
             return "paragraph"
+        if tag == "img":
+            return "image"
+        if tag == "figure" and node.find("img"):
+            return "image"
         testid = (node.get("data-testid") or "").lower()
         if testid:
             if "heading" in testid or "title" in testid or "subhead" in testid:
@@ -106,31 +114,61 @@ def extract_fallback_text(full_soup):
             if "paragraph" in testid or "body" in testid or "text" in testid:
                 return "paragraph"
         if tag == "div":
-            if node.find(["p", "h1", "h2", "h3", "h4", "h5", "h6"], recursive=True):
+            if node.find(
+                ["p", "h1", "h2", "h3", "h4", "h5", "h6", "img", "figure"],
+                recursive=True,
+            ):
                 return None
             class_name = " ".join(node.get("class", [])).lower()
             if "paragraph" in class_name or "body" in class_name or "text" in class_name:
                 return "paragraph"
+            if "heading" in class_name or "headline" in class_name or "title" in class_name:
+                return "heading"
         if has_testid and testid:
             return "paragraph"
         return None
 
-    nodes = container.find_all(lambda n: classify_node(n) is not None)
-    parts = []
-    for node in nodes:
+    def iter_blocks(node):
         kind = classify_node(node)
-        text = node.get_text(" ", strip=True)
-        if not text:
-            continue
-        if kind == "heading":
-            parts.append(text.upper())
+        if kind:
+            if kind == "image":
+                img = node if node.name == "img" else node.find("img")
+                if not img:
+                    return
+                src = pick_image_src(img)
+                if not src or src.startswith("data:"):
+                    return
+                alt = (img.get("alt") or "").strip()
+                yield ("image", urljoin(base_url, src), alt)
+                return
+            text = node.get_text(" ", strip=True)
+            if text:
+                yield (kind, text)
+            return
+
+        for child in getattr(node, "children", []):
+            if isinstance(child, Tag):
+                yield from iter_blocks(child)
+
+    blocks = []
+    image_info = {}
+    for kind, value, *rest in iter_blocks(container):
+        if kind == "image":
+            token = f"__IMG_FALLBACK_{len(image_info)}__"
+            alt = rest[0] if rest else ""
+            image_info[token] = {"url": value, "alt": alt}
+            blocks.append(("image", token))
+        elif kind == "heading":
+            blocks.append(("heading", value.upper()))
         else:
-            parts.append(text)
+            blocks.append(("paragraph", value))
 
-    if not parts:
-        return container.get_text("\n")
+    if not blocks:
+        text = container.get_text("\n")
+        if text.strip():
+            blocks.append(("paragraph", text))
 
-    return "\n\n".join(parts)
+    return blocks, image_info
 
 
 def _download(url: str) -> bytes:
@@ -227,69 +265,104 @@ async def main() -> int:
     )
     header = f"{title or 'Unknown'} | {author or 'Unknown'} | {publication or 'Unknown'}"
 
-    image_info = {}
-    for i, img in enumerate(soup.find_all("img")):
-        src = pick_image_src(img)
-        if not src or src.startswith("data:"):
-            img.decompose()
-            continue
-        alt = (img.get("alt") or "").strip()
-        token = f"__IMG_{i}__"
-        img.replace_with(soup.new_string(f"\n{token}\n"))
-        image_info[token] = {"url": urljoin(url, src), "alt": alt}
-
-    fallback_tokens = []
-    if not image_info:
-        meta_image = find_meta_image(full_soup)
-        if meta_image:
-            token = "__IMG_FALLBACK_0__"
-            image_info[token] = {"url": urljoin(url, meta_image), "alt": "Top image"}
-            fallback_tokens.append(token)
-        else:
-            article_tag = full_soup.find("article")
-            if article_tag:
-                img = article_tag.find("img")
-                src = pick_image_src(img) if img else None
-                if src and not src.startswith("data:"):
-                    token = "__IMG_FALLBACK_0__"
-                    image_info[token] = {"url": urljoin(url, src), "alt": (img.get("alt") or "").strip()}
-                    fallback_tokens.append(token)
-
-    image_ansi_map = await build_image_ansi_map(image_info) if image_info else {}
-
     text = soup.get_text("\n")
     text_len = len(text.strip())
     summary_headings = count_headings(soup)
     full_container = full_soup.find("article") or full_soup
     full_headings = count_headings(full_container)
-    if text_len < MIN_TEXT_CHARS or (full_headings > 1 and summary_headings < full_headings):
-        text = extract_fallback_text(full_soup)
+    use_fallback = text_len < MIN_TEXT_CHARS or (full_headings > 1 and summary_headings < full_headings)
 
-    lines = [line.strip() for line in text.splitlines()]
+    fallback_blocks = []
+    image_info = {}
+    fallback_tokens = []
+    if use_fallback:
+        fallback_blocks, image_info = extract_fallback_blocks(full_soup, url)
+        if not image_info:
+            meta_image = find_meta_image(full_soup)
+            if meta_image:
+                token = "__IMG_FALLBACK_0__"
+                image_info[token] = {"url": urljoin(url, meta_image), "alt": "Top image"}
+                fallback_blocks.insert(0, ("image", token))
+            else:
+                article_tag = full_soup.find("article")
+                if article_tag:
+                    img = article_tag.find("img")
+                    src = pick_image_src(img) if img else None
+                    if src and not src.startswith("data:"):
+                        token = "__IMG_FALLBACK_0__"
+                        image_info[token] = {"url": urljoin(url, src), "alt": (img.get("alt") or "").strip()}
+                        fallback_blocks.insert(0, ("image", token))
+    else:
+        for i, img in enumerate(soup.find_all("img")):
+            src = pick_image_src(img)
+            if not src or src.startswith("data:"):
+                img.decompose()
+                continue
+            alt = (img.get("alt") or "").strip()
+            token = f"__IMG_{i}__"
+            img.replace_with(soup.new_string(f"\n{token}\n"))
+            image_info[token] = {"url": urljoin(url, src), "alt": alt}
+
+        if not image_info:
+            meta_image = find_meta_image(full_soup)
+            if meta_image:
+                token = "__IMG_FALLBACK_0__"
+                image_info[token] = {"url": urljoin(url, meta_image), "alt": "Top image"}
+                fallback_tokens.append(token)
+            else:
+                article_tag = full_soup.find("article")
+                if article_tag:
+                    img = article_tag.find("img")
+                    src = pick_image_src(img) if img else None
+                    if src and not src.startswith("data:"):
+                        token = "__IMG_FALLBACK_0__"
+                        image_info[token] = {"url": urljoin(url, src), "alt": (img.get("alt") or "").strip()}
+                        fallback_tokens.append(token)
+
+        text = soup.get_text("\n")
+
+    image_ansi_map = await build_image_ansi_map(image_info) if image_info else {}
+
     paragraphs = []
     current = []
-
-    for line in lines:
-        if line.startswith(HEADER_MARKER):
-            heading = line[len(HEADER_MARKER):].strip().upper()
-            if heading:
+    if use_fallback:
+        for kind, value in fallback_blocks:
+            if kind == "heading":
                 if current:
                     paragraphs.append(" ".join(current))
                     current = []
-                paragraphs.append(heading)
-            continue
-        if line in image_info:
-            if current:
-                paragraphs.append(" ".join(current))
-                current = []
-            paragraphs.append(line)
-            continue
-        if not line:
-            if current:
-                paragraphs.append(" ".join(current))
-                current = []
-            continue
-        current.append(line)
+                paragraphs.append(value)
+            elif kind == "image":
+                if current:
+                    paragraphs.append(" ".join(current))
+                    current = []
+                paragraphs.append(value)
+            else:
+                if value:
+                    paragraphs.append(value)
+    else:
+        lines = [line.strip() for line in text.splitlines()]
+        for line in lines:
+            if line.startswith(HEADER_MARKER):
+                heading = line[len(HEADER_MARKER):].strip().upper()
+                if heading:
+                    if current:
+                        paragraphs.append(" ".join(current))
+                        current = []
+                    paragraphs.append(heading)
+                continue
+            if line in image_info:
+                if current:
+                    paragraphs.append(" ".join(current))
+                    current = []
+                paragraphs.append(line)
+                continue
+            if not line:
+                if current:
+                    paragraphs.append(" ".join(current))
+                    current = []
+                continue
+            current.append(line)
 
     if current:
         paragraphs.append(" ".join(current))
