@@ -13,6 +13,8 @@ UA = "Mozilla/5.0"
 HALF_BLOCK = "\u2580"
 MAX_IMAGE_WIDTH = 120
 MIN_IMAGE_AREA = 64 * 64
+MIN_TEXT_CHARS = 200
+HEADER_MARKER = "__HDR__"
 
 async def fetch_html(url: str) -> str:
     async with async_playwright() as p:
@@ -67,6 +69,68 @@ def normalize_publication(name: str | None) -> str | None:
     if name.startswith("@") and len(name) > 1:
         name = name[1:]
     return name or None
+
+
+def mark_headings(soup):
+    for heading in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"]):
+        text = heading.get_text(" ", strip=True)
+        if not text:
+            continue
+        heading.clear()
+        heading.append(f"{HEADER_MARKER}{text}")
+
+
+def count_headings(soup):
+    return len(soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"]))
+
+
+def extract_fallback_text(full_soup):
+    container = full_soup.find("article") or full_soup
+    for tag in container(["script", "style", "noscript", "iframe"]):
+        tag.decompose()
+
+    has_testid = container.find(attrs={"data-testid": True}) is not None
+
+    def classify_node(node):
+        if not getattr(node, "name", None):
+            return None
+        tag = node.name
+        if tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            return "heading"
+        if tag == "p":
+            return "paragraph"
+        testid = (node.get("data-testid") or "").lower()
+        if testid:
+            if "heading" in testid or "title" in testid or "subhead" in testid:
+                return "heading"
+            if "paragraph" in testid or "body" in testid or "text" in testid:
+                return "paragraph"
+        if tag == "div":
+            if node.find(["p", "h1", "h2", "h3", "h4", "h5", "h6"], recursive=True):
+                return None
+            class_name = " ".join(node.get("class", [])).lower()
+            if "paragraph" in class_name or "body" in class_name or "text" in class_name:
+                return "paragraph"
+        if has_testid and testid:
+            return "paragraph"
+        return None
+
+    nodes = container.find_all(lambda n: classify_node(n) is not None)
+    parts = []
+    for node in nodes:
+        kind = classify_node(node)
+        text = node.get_text(" ", strip=True)
+        if not text:
+            continue
+        if kind == "heading":
+            parts.append(text.upper())
+        else:
+            parts.append(text)
+
+    if not parts:
+        return container.get_text("\n")
+
+    return "\n\n".join(parts)
 
 
 def _download(url: str) -> bytes:
@@ -148,6 +212,8 @@ async def main() -> int:
     for tag in soup(["script", "style", "noscript", "iframe"]):
         tag.decompose()
 
+    mark_headings(soup)
+
     title = doc.short_title() or doc.title() or find_meta_content(full_soup, ("og:title", "twitter:title"))
     author = doc.author() or find_meta_content(
         full_soup,
@@ -192,12 +258,26 @@ async def main() -> int:
     image_ansi_map = await build_image_ansi_map(image_info) if image_info else {}
 
     text = soup.get_text("\n")
+    text_len = len(text.strip())
+    summary_headings = count_headings(soup)
+    full_container = full_soup.find("article") or full_soup
+    full_headings = count_headings(full_container)
+    if text_len < MIN_TEXT_CHARS or (full_headings > 1 and summary_headings < full_headings):
+        text = extract_fallback_text(full_soup)
 
     lines = [line.strip() for line in text.splitlines()]
     paragraphs = []
     current = []
 
     for line in lines:
+        if line.startswith(HEADER_MARKER):
+            heading = line[len(HEADER_MARKER):].strip().upper()
+            if heading:
+                if current:
+                    paragraphs.append(" ".join(current))
+                    current = []
+                paragraphs.append(heading)
+            continue
         if line in image_info:
             if current:
                 paragraphs.append(" ".join(current))
