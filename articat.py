@@ -7,6 +7,7 @@ from urllib.request import Request, urlopen
 from playwright.async_api import async_playwright
 from PIL import Image
 from readability import Document
+import re
 from bs4 import BeautifulSoup, Tag
 
 UA = "Mozilla/5.0"
@@ -16,32 +17,108 @@ MIN_IMAGE_AREA = 64 * 64
 MIN_TEXT_CHARS = 200
 HEADER_MARKER = "__HDR__"
 
-async def fetch_html(url: str) -> str:
+async def fetch_html(url: str, debug: bool = False) -> str:
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(user_agent=UA)
         page = await context.new_page()
         await page.goto(url, wait_until="domcontentloaded")
+        previous_height = 0
+        for _ in range(12):
+            height = await page.evaluate("document.body.scrollHeight")
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(1000)
+            if height == previous_height:
+                break
+            previous_height = height
         html = await page.content()
+        if debug:
+            print("[debug] fetched html length:", len(html), file=sys.stderr)
         await browser.close()
         return html
 
 
 def pick_image_src(tag):
-    src = tag.get("src")
-    if src:
-        return src
+    if not isinstance(tag, Tag):
+        return None
 
-    for key in ("data-src", "data-original", "data-lazy-src"):
+    def parse_srcset(srcset):
+        best_any = (None, -1.0)
+        best_non_webp = (None, -1.0)
+        for part in srcset.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            bits = part.split()
+            url = bits[0]
+            score = 0.0
+            if len(bits) > 1:
+                descriptor = bits[-1]
+                if descriptor.endswith("w") and descriptor[:-1].isdigit():
+                    score = float(descriptor[:-1])
+                elif descriptor.endswith("x"):
+                    try:
+                        score = float(descriptor[:-1]) * 1000.0
+                    except ValueError:
+                        score = 0.0
+            is_webp = ".webp" in url.lower() or "format=webp" in url.lower() or "fm=webp" in url.lower()
+            if score >= best_any[1]:
+                best_any = (url, score)
+            if not is_webp and score >= best_non_webp[1]:
+                best_non_webp = (url, score)
+        return best_non_webp[0] or best_any[0]
+
+    if tag.name == "picture":
+        for source in tag.find_all("source"):
+            srcset = source.get("srcset") or source.get("data-srcset") or source.get("data-lazy-srcset")
+            if srcset:
+                return parse_srcset(srcset)
+        img = tag.find("img")
+        if img:
+            return pick_image_src(img)
+        return None
+
+    if tag.name == "source":
+        srcset = tag.get("srcset") or tag.get("data-srcset") or tag.get("data-lazy-srcset")
+        if srcset:
+            return parse_srcset(srcset)
+        return None
+
+    srcset = (
+        tag.get("srcset")
+        or tag.get("data-srcset")
+        or tag.get("data-lazy-srcset")
+        or tag.get("data-src-set")
+        or tag.get("data-bgset")
+    )
+    if srcset:
+        return parse_srcset(srcset)
+
+    for key in (
+        "data-src",
+        "data-original",
+        "data-lazy-src",
+        "data-url",
+        "data-bg",
+        "data-background",
+        "data-background-image",
+        "data-image",
+    ):
         src = tag.get(key)
         if src:
             return src
 
-    srcset = tag.get("srcset") or tag.get("data-srcset")
-    if srcset:
-        candidates = [part.strip().split(" ")[0] for part in srcset.split(",") if part.strip()]
-        if candidates:
-            return candidates[-1]
+    src = tag.get("src")
+    if src and not src.startswith("data:"):
+        return src
+
+    if tag.parent and tag.parent.name == "picture":
+        return pick_image_src(tag.parent)
+
+    style = tag.get("style") or ""
+    match = re.search(r"background-image\\s*:\\s*url\\(([^)]+)\\)", style, re.I)
+    if match:
+        return match.group(1).strip(" \"'")
 
     return None
 
@@ -62,6 +139,48 @@ def find_meta_content(soup, keys):
     return None
 
 
+def infer_cdn_prefix(soup):
+    hero = find_meta_image(soup)
+    if not hero:
+        return None
+    match = re.match(r"^(https?://[^/]+/.*/image/upload/)", hero)
+    if match:
+        return match.group(1)
+    return None
+
+
+def resolve_image_url(src: str | None, base_url: str, cdn_prefix: str | None) -> str | None:
+    if not src:
+        return None
+    src = src.strip()
+    if not src:
+        return None
+    if src.startswith("//"):
+        return "https:" + src
+    if src.startswith("http://") or src.startswith("https://"):
+        return src
+    if cdn_prefix and re.match(r"^(w_|c_|q_|t_|g_)", src):
+        return normalize_image_url(cdn_prefix + src.lstrip("/"))
+    return normalize_image_url(urljoin(base_url, src))
+
+
+def normalize_image_url(url: str) -> str:
+    if "/image/upload/" not in url:
+        return url
+    if "images.complex.com" not in url and "cloudinary" not in url:
+        return url
+    prefix, rest = url.split("/image/upload/", 1)
+    if "/" in rest:
+        first, remainder = rest.split("/", 1)
+        if "f_auto" in first:
+            first = first.replace("f_auto", "f_jpg")
+            return f"{prefix}/image/upload/{first}/{remainder}"
+        if first.startswith("v") and first[1:].isdigit():
+            return f"{prefix}/image/upload/f_jpg/{rest}"
+        return f"{prefix}/image/upload/f_jpg,{first}/{remainder}"
+    return f"{prefix}/image/upload/f_jpg/{rest}"
+
+
 def normalize_publication(name: str | None) -> str | None:
     if not name:
         return None
@@ -80,14 +199,40 @@ def mark_headings(soup):
         heading.append(f"{HEADER_MARKER}{text}")
 
 
+def unwrap_noscript_images(soup):
+    for noscript in soup.find_all("noscript"):
+        try:
+            inner = BeautifulSoup(noscript.decode_contents(), "lxml")
+        except Exception:
+            noscript.decompose()
+            continue
+        for node in inner.find_all(["img", "picture", "source", "figure"]):
+            noscript.insert_before(node)
+        noscript.decompose()
+
+
 def count_headings(soup):
     return len(soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"]))
 
 
-def extract_fallback_blocks(full_soup, base_url):
-    container = full_soup.find("article") or full_soup
+def count_images(soup):
+    sources = set()
+    for node in soup.find_all(True):
+        if node.name == "source":
+            continue
+        if node.name == "img" and node.find_parent("picture"):
+            continue
+        src = pick_image_src(node)
+        if src and not src.startswith("data:"):
+            sources.add(src)
+    return len(sources)
+
+
+def extract_fallback_blocks(full_soup, base_url, cdn_prefix):
+    container = full_soup.find("article") or full_soup.find("main") or full_soup
+    unwrap_noscript_images(container)
     for tag in container(
-        ["script", "style", "noscript", "iframe", "nav", "header", "footer", "aside"]
+        ["script", "style", "iframe", "nav", "header", "footer", "aside"]
     ):
         tag.decompose()
     for tag in container.find_all(attrs={"role": ["navigation", "banner", "contentinfo"]}):
@@ -99,13 +244,13 @@ def extract_fallback_blocks(full_soup, base_url):
         if not isinstance(node, Tag):
             return None
         tag = node.name
+        if tag not in ("source", "script", "style") and pick_image_src(node):
+            return "image"
         if tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
             return "heading"
         if tag == "p":
             return "paragraph"
-        if tag == "img":
-            return "image"
-        if tag == "figure" and node.find("img"):
+        if tag == "figure" and node.find(["img", "picture"]):
             return "image"
         testid = (node.get("data-testid") or "").lower()
         if testid:
@@ -115,7 +260,7 @@ def extract_fallback_blocks(full_soup, base_url):
                 return "paragraph"
         if tag == "div":
             if node.find(
-                ["p", "h1", "h2", "h3", "h4", "h5", "h6", "img", "figure"],
+                ["p", "h1", "h2", "h3", "h4", "h5", "h6", "img", "figure", "picture"],
                 recursive=True,
             ):
                 return None
@@ -132,14 +277,18 @@ def extract_fallback_blocks(full_soup, base_url):
         kind = classify_node(node)
         if kind:
             if kind == "image":
-                img = node if node.name == "img" else node.find("img")
-                if not img:
+                img = None
+                src = pick_image_src(node)
+                if node.name == "img":
+                    img = node
+                if not src:
+                    img = node.find("img") or node.find("picture")
+                    src = pick_image_src(img) if img else None
+                resolved = resolve_image_url(src, base_url, cdn_prefix)
+                if not resolved or resolved.startswith("data:"):
                     return
-                src = pick_image_src(img)
-                if not src or src.startswith("data:"):
-                    return
-                alt = (img.get("alt") or "").strip()
-                yield ("image", urljoin(base_url, src), alt)
+                alt = (img.get("alt") or "").strip() if img else ""
+                yield ("image", resolved, alt)
                 return
             text = node.get_text(" ", strip=True)
             if text:
@@ -156,7 +305,7 @@ def extract_fallback_blocks(full_soup, base_url):
         if kind == "image":
             token = f"__IMG_FALLBACK_{len(image_info)}__"
             alt = rest[0] if rest else ""
-            image_info[token] = {"url": value, "alt": alt}
+            image_info[token] = {"url": value, "alt": alt, "referer": base_url}
             blocks.append(("image", token))
         elif kind == "heading":
             blocks.append(("heading", value.upper()))
@@ -171,21 +320,35 @@ def extract_fallback_blocks(full_soup, base_url):
     return blocks, image_info
 
 
-def _download(url: str) -> bytes:
-    req = Request(url, headers={"User-Agent": UA})
+def _download(url: str, referer: str | None = None, debug: bool = False) -> bytes:
+    headers = {"User-Agent": UA}
+    if referer:
+        headers["Referer"] = referer
+    req = Request(url, headers=headers)
     with urlopen(req, timeout=15) as response:
-        return response.read()
+        data = response.read()
+        if debug:
+            print(f"[debug] downloaded {len(data)} bytes: {url}", file=sys.stderr)
+        return data
 
 
-async def fetch_image_bytes(url: str) -> bytes:
-    return await asyncio.to_thread(_download, url)
+async def fetch_image_bytes(url: str, referer: str | None = None, debug: bool = False) -> bytes:
+    return await asyncio.to_thread(_download, url, referer, debug)
 
 
-def image_bytes_to_ansi(image_bytes: bytes, width: int = MAX_IMAGE_WIDTH) -> str | None:
+def image_bytes_to_ansi(
+    image_bytes: bytes,
+    width: int = MAX_IMAGE_WIDTH,
+    debug: bool = False,
+) -> str | None:
     with Image.open(io.BytesIO(image_bytes)) as img:
+        if debug:
+            print(f"[debug] image format={img.format} size={img.size}", file=sys.stderr)
         img = img.convert("RGB")
         w, h = img.size
         if w * h < MIN_IMAGE_AREA:
+            if debug:
+                print(f"[debug] image skipped small size={w}x{h}", file=sys.stderr)
             return None
         new_width = min(width, w)
         new_height = max(2, int((h / w) * new_width))
@@ -207,18 +370,22 @@ def image_bytes_to_ansi(image_bytes: bytes, width: int = MAX_IMAGE_WIDTH) -> str
         return "\n".join(lines)
 
 
-async def build_image_ansi_map(image_info: dict[str, dict[str, str]]) -> dict[str, str]:
+async def build_image_ansi_map(image_info: dict[str, dict[str, str]], debug: bool = False) -> dict[str, str]:
     semaphore = asyncio.Semaphore(4)
 
     async def worker(token: str, info: dict[str, str]) -> tuple[str, str | None]:
         async with semaphore:
             try:
-                image_bytes = await fetch_image_bytes(info["url"])
-                ansi_art = image_bytes_to_ansi(image_bytes)
-            except Exception:
+                image_bytes = await fetch_image_bytes(info["url"], info.get("referer"), debug)
+                ansi_art = image_bytes_to_ansi(image_bytes, debug=debug)
+            except Exception as exc:
+                if debug:
+                    print(f"[debug] image failed {info.get('url')}: {exc}", file=sys.stderr)
                 return token, None
 
         if not ansi_art:
+            if debug:
+                print(f"[debug] image produced no render {info.get('url')}", file=sys.stderr)
             return token, None
 
         alt = info.get("alt", "")
@@ -226,6 +393,9 @@ async def build_image_ansi_map(image_info: dict[str, dict[str, str]]) -> dict[st
             return token, f"[Image: {alt}]\n{ansi_art}"
         return token, ansi_art
 
+    if debug:
+        for token, info in image_info.items():
+            print(f"[debug] image token {token}: {info.get('url')}", file=sys.stderr)
     tasks = [worker(token, info) for token, info in image_info.items()]
     results = await asyncio.gather(*tasks)
     return {token: art for token, art in results if art}
@@ -236,18 +406,27 @@ async def main() -> int:
         print("usage: articat <url>")
         return 1
 
-    url = sys.argv[1]
+    debug = "--debug-images" in sys.argv
+    args = [arg for arg in sys.argv[1:] if not arg.startswith("--")]
+    if not args:
+        print("usage: articat <url> [--debug-images]")
+        return 1
 
-    html = await fetch_html(url)
+    url = args[0]
+
+    html = await fetch_html(url, debug)
 
     full_soup = BeautifulSoup(html, "lxml")
+    unwrap_noscript_images(full_soup)
+    cdn_prefix = infer_cdn_prefix(full_soup)
 
     doc = Document(html, url=url)
     article_html = doc.summary(html_partial=True, keep_all_images=True)
 
     soup = BeautifulSoup(article_html, "lxml")
 
-    for tag in soup(["script", "style", "noscript", "iframe"]):
+    unwrap_noscript_images(soup)
+    for tag in soup(["script", "style", "iframe"]):
         tag.decompose()
 
     mark_headings(soup)
@@ -268,29 +447,41 @@ async def main() -> int:
     text = soup.get_text("\n")
     text_len = len(text.strip())
     summary_headings = count_headings(soup)
-    full_container = full_soup.find("article") or full_soup
+    summary_images = count_images(soup)
+    full_container = full_soup.find("article") or full_soup.find("main") or full_soup
     full_headings = count_headings(full_container)
-    use_fallback = text_len < MIN_TEXT_CHARS or (full_headings > 1 and summary_headings < full_headings)
+    full_images = count_images(full_container)
+    use_fallback = (
+        text_len < MIN_TEXT_CHARS
+        or (full_headings > 1 and summary_headings < full_headings)
+        or (full_images > summary_images)
+    )
 
     fallback_blocks = []
     image_info = {}
     fallback_tokens = []
     if use_fallback:
-        fallback_blocks, image_info = extract_fallback_blocks(full_soup, url)
+        fallback_blocks, image_info = extract_fallback_blocks(full_soup, url, cdn_prefix)
         if not image_info:
             meta_image = find_meta_image(full_soup)
-            if meta_image:
+            resolved_meta = resolve_image_url(meta_image, url, cdn_prefix)
+            if resolved_meta:
                 token = "__IMG_FALLBACK_0__"
-                image_info[token] = {"url": urljoin(url, meta_image), "alt": "Top image"}
+                image_info[token] = {"url": resolved_meta, "alt": "Top image", "referer": url}
                 fallback_blocks.insert(0, ("image", token))
             else:
                 article_tag = full_soup.find("article")
                 if article_tag:
                     img = article_tag.find("img")
                     src = pick_image_src(img) if img else None
-                    if src and not src.startswith("data:"):
+                    resolved = resolve_image_url(src, url, cdn_prefix)
+                    if resolved and not resolved.startswith("data:"):
                         token = "__IMG_FALLBACK_0__"
-                        image_info[token] = {"url": urljoin(url, src), "alt": (img.get("alt") or "").strip()}
+                        image_info[token] = {
+                            "url": resolved,
+                            "alt": (img.get("alt") or "").strip(),
+                            "referer": url,
+                        }
                         fallback_blocks.insert(0, ("image", token))
     else:
         for i, img in enumerate(soup.find_all("img")):
@@ -301,27 +492,51 @@ async def main() -> int:
             alt = (img.get("alt") or "").strip()
             token = f"__IMG_{i}__"
             img.replace_with(soup.new_string(f"\n{token}\n"))
-            image_info[token] = {"url": urljoin(url, src), "alt": alt}
+            resolved = resolve_image_url(src, url, cdn_prefix)
+            if not resolved:
+                continue
+            image_info[token] = {"url": resolved, "alt": alt, "referer": url}
 
         if not image_info:
             meta_image = find_meta_image(full_soup)
-            if meta_image:
+            resolved_meta = resolve_image_url(meta_image, url, cdn_prefix)
+            if resolved_meta:
                 token = "__IMG_FALLBACK_0__"
-                image_info[token] = {"url": urljoin(url, meta_image), "alt": "Top image"}
+                image_info[token] = {"url": resolved_meta, "alt": "Top image", "referer": url}
                 fallback_tokens.append(token)
             else:
                 article_tag = full_soup.find("article")
                 if article_tag:
                     img = article_tag.find("img")
                     src = pick_image_src(img) if img else None
-                    if src and not src.startswith("data:"):
+                    resolved = resolve_image_url(src, url, cdn_prefix)
+                    if resolved and not resolved.startswith("data:"):
                         token = "__IMG_FALLBACK_0__"
-                        image_info[token] = {"url": urljoin(url, src), "alt": (img.get("alt") or "").strip()}
+                        image_info[token] = {
+                            "url": resolved,
+                            "alt": (img.get("alt") or "").strip(),
+                            "referer": url,
+                        }
                         fallback_tokens.append(token)
 
         text = soup.get_text("\n")
 
-    image_ansi_map = await build_image_ansi_map(image_info) if image_info else {}
+    image_ansi_map = await build_image_ansi_map(image_info, debug) if image_info else {}
+    if not image_ansi_map:
+        hero = find_meta_image(full_soup)
+        hero = resolve_image_url(hero, url, cdn_prefix)
+        if not hero:
+            article_tag = full_soup.find("article") or full_soup.find("main")
+            if article_tag:
+                hero = resolve_image_url(
+                    pick_image_src(article_tag.find("img") or article_tag.find("picture")),
+                    url,
+                    cdn_prefix,
+                )
+        if hero:
+            token = "__IMG_HERO__"
+            image_info = {token: {"url": hero, "alt": "Top image", "referer": url}}
+            image_ansi_map = await build_image_ansi_map(image_info, debug)
 
     paragraphs = []
     current = []
@@ -366,6 +581,10 @@ async def main() -> int:
 
     if current:
         paragraphs.append(" ".join(current))
+
+    hero_token = "__IMG_HERO__"
+    if hero_token in image_info and hero_token not in paragraphs:
+        paragraphs.insert(0, hero_token)
 
     normalized = "\n\n".join(paragraphs)
     if fallback_tokens:
