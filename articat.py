@@ -2,6 +2,9 @@
 import sys
 import io
 import asyncio
+import json
+import math
+from datetime import datetime
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 from playwright.async_api import async_playwright
@@ -16,6 +19,12 @@ MAX_IMAGE_WIDTH = 120
 MIN_IMAGE_AREA = 64 * 64
 MIN_TEXT_CHARS = 200
 HEADER_MARKER = "__HDR__"
+JUNK_RE = re.compile(
+    r"(nav|menu|breadcrumb|header|footer|masthead|sidebar|related|promo|sponsor|"
+    r"subscribe|newsletter|social|share|signin|login|cookie|advert|ads?|banner|"
+    r"widget|search|comment|comments|trending|popular|recommend)",
+    re.I,
+)
 
 async def fetch_html(url: str, debug: bool = False) -> str:
     async with async_playwright() as p:
@@ -190,6 +199,76 @@ def normalize_publication(name: str | None) -> str | None:
     return name or None
 
 
+def extract_ld_json(soup):
+    blocks = []
+    for tag in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        raw = tag.string or tag.get_text(strip=True)
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+        blocks.append(data)
+    return blocks
+
+
+def extract_published_date(soup):
+    meta_date = find_meta_content(
+        soup,
+        (
+            "article:published_time",
+            "og:article:published_time",
+            "datePublished",
+            "publish_date",
+            "pubdate",
+            "publishdate",
+            "timestamp",
+            "date",
+        ),
+    )
+    if meta_date:
+        return meta_date
+
+    for block in extract_ld_json(soup):
+        items = block if isinstance(block, list) else [block]
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if "datePublished" in item:
+                return item.get("datePublished")
+            if "@graph" in item and isinstance(item["@graph"], list):
+                for node in item["@graph"]:
+                    if isinstance(node, dict) and "datePublished" in node:
+                        return node.get("datePublished")
+    return None
+
+
+def format_date(value: str | None) -> str | None:
+    if not value:
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    try:
+        cleaned = raw.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(cleaned)
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return raw
+
+
+def extract_canonical_url(soup, fallback_url: str) -> str:
+    link = soup.find("link", attrs={"rel": "canonical"})
+    href = link.get("href") if link else None
+    if href:
+        return href.strip()
+    meta = find_meta_content(soup, ("og:url",))
+    if meta:
+        return meta.strip()
+    return fallback_url
+
+
 def mark_headings(soup):
     for heading in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"]):
         text = heading.get_text(" ", strip=True)
@@ -209,6 +288,23 @@ def unwrap_noscript_images(soup):
         for node in inner.find_all(["img", "picture", "source", "figure"]):
             noscript.insert_before(node)
         noscript.decompose()
+
+
+def strip_junk_nodes(container):
+    for tag in container.find_all(True):
+        if not getattr(tag, "attrs", None):
+            continue
+        ident = " ".join(tag.get("class", [])) + " " + (tag.get("id") or "")
+        if not ident or not JUNK_RE.search(ident):
+            continue
+        if tag.name in ("article", "main"):
+            continue
+        if tag.find(["article", "main"]):
+            continue
+        text_len = len(tag.get_text(" ", strip=True))
+        if text_len > 200:
+            continue
+        tag.decompose()
 
 
 def count_headings(soup):
@@ -231,6 +327,7 @@ def count_images(soup):
 def extract_fallback_blocks(full_soup, base_url, cdn_prefix):
     container = full_soup.find("article") or full_soup.find("main") or full_soup
     unwrap_noscript_images(container)
+    strip_junk_nodes(container)
     for tag in container(
         ["script", "style", "iframe", "nav", "header", "footer", "aside"]
     ):
@@ -426,6 +523,7 @@ async def main() -> int:
     soup = BeautifulSoup(article_html, "lxml")
 
     unwrap_noscript_images(soup)
+    strip_junk_nodes(soup)
     for tag in soup(["script", "style", "iframe"]):
         tag.decompose()
 
@@ -442,7 +540,8 @@ async def main() -> int:
             ("og:site_name", "application-name", "publisher", "article:publisher", "twitter:site", "apple-mobile-web-app-title"),
         )
     )
-    header = f"{title or 'Unknown'} | {author or 'Unknown'} | {publication or 'Unknown'}"
+    published = format_date(extract_published_date(full_soup))
+    canonical_url = extract_canonical_url(full_soup, url)
 
     text = soup.get_text("\n")
     text_len = len(text.strip())
@@ -592,14 +691,31 @@ async def main() -> int:
     for token in image_info:
         normalized = normalized.replace(token, image_ansi_map.get(token, ""))
 
-    print("\n\n")
     normalized = normalized.strip("\n")
+    content_for_reading = "\n\n".join(p for p in paragraphs if not p.startswith("__IMG_"))
+    words = re.findall(r"[A-Za-z0-9']+", content_for_reading)
+    read_minutes = math.ceil(len(words) / 200) if words else None
+
+    header_lines = []
+    header_lines.append(title or "Unknown title")
+    byline_parts = [part for part in [author, publication] if part]
+    if byline_parts:
+        header_lines.append(" | ".join(byline_parts))
+    meta_parts = []
+    if published:
+        meta_parts.append(f"Published: {published}")
+    if read_minutes:
+        meta_parts.append(f"Read time: {read_minutes} min")
+    if meta_parts:
+        header_lines.append(" | ".join(meta_parts))
+    if canonical_url:
+        header_lines.append(f"URL: {canonical_url}")
+
+    print("\n\n")
+    print("\n".join(header_lines))
     if normalized:
-        print(header)
         print()
         print(normalized)
-    else:
-        print(header)
     return 0
 
 
