@@ -19,6 +19,7 @@ MAX_IMAGE_WIDTH = 120
 MIN_IMAGE_AREA = 64 * 64
 MIN_TEXT_CHARS = 200
 HEADER_MARKER = "__HDR__"
+SPINNER_FRAMES = ["|", "/", "-", "\\"]
 JUNK_RE = re.compile(
     r"(nav|menu|breadcrumb|header|footer|masthead|sidebar|related|promo|sponsor|"
     r"subscribe|newsletter|social|share|signin|login|cookie|advert|ads?|banner|"
@@ -45,6 +46,32 @@ async def fetch_html(url: str, debug: bool = False) -> str:
             print("[debug] fetched html length:", len(html), file=sys.stderr)
         await browser.close()
         return html
+
+
+async def _spinner(label: str, stop_event: asyncio.Event) -> None:
+    if not sys.stderr.isatty():
+        return
+    i = 0
+    while not stop_event.is_set():
+        frame = SPINNER_FRAMES[i % len(SPINNER_FRAMES)]
+        sys.stderr.write(f"\r{label} {frame}")
+        sys.stderr.flush()
+        await asyncio.sleep(0.1)
+        i += 1
+    sys.stderr.write("\r" + (" " * (len(label) + 2)) + "\r")
+    sys.stderr.flush()
+
+
+async def run_with_spinner(coro, label: str):
+    if not sys.stderr.isatty():
+        return await coro
+    stop_event = asyncio.Event()
+    spinner_task = asyncio.create_task(_spinner(label, stop_event))
+    try:
+        return await coro
+    finally:
+        stop_event.set()
+        await spinner_task
 
 
 def pick_image_src(tag):
@@ -511,7 +538,7 @@ async def main() -> int:
 
     url = args[0]
 
-    html = await fetch_html(url, debug)
+    html = await run_with_spinner(fetch_html(url, debug), "Fetching page")
 
     full_soup = BeautifulSoup(html, "lxml")
     unwrap_noscript_images(full_soup)
@@ -620,7 +647,11 @@ async def main() -> int:
 
         text = soup.get_text("\n")
 
-    image_ansi_map = await build_image_ansi_map(image_info, debug) if image_info else {}
+    image_ansi_map = (
+        await run_with_spinner(build_image_ansi_map(image_info, debug), "Rendering images")
+        if image_info
+        else {}
+    )
     if not image_ansi_map:
         hero = find_meta_image(full_soup)
         hero = resolve_image_url(hero, url, cdn_prefix)
@@ -635,7 +666,10 @@ async def main() -> int:
         if hero:
             token = "__IMG_HERO__"
             image_info = {token: {"url": hero, "alt": "Top image", "referer": url}}
-            image_ansi_map = await build_image_ansi_map(image_info, debug)
+            image_ansi_map = await run_with_spinner(
+                build_image_ansi_map(image_info, debug),
+                "Rendering images",
+            )
 
     paragraphs = []
     current = []
